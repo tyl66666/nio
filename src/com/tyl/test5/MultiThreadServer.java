@@ -1,18 +1,20 @@
 package com.tyl.test5;
 
+import com.sun.corba.se.spi.orbutil.threadpool.Work;
+
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
-import java.nio.channels.ServerSocketChannel;
-import java.nio.channels.SocketChannel;
+import java.nio.channels.*;
 import java.util.Iterator;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author tyl
  * @date 2023/10/27
+ * 注意： 当代码执行顺序有前后关系是 最好是在同一个线程 不要将代码放在不同线程 这个无法做到准确的前后关系
  */
 public class MultiThreadServer {
     public static void main(String[] args) throws IOException {
@@ -23,6 +25,13 @@ public class MultiThreadServer {
         SelectionKey bosskey = ssc.register(boss, 0, null);
         bosskey.interestOps(SelectionKey.OP_ACCEPT);
         ssc.bind(new InetSocketAddress(8888));
+        //创建固定数量的worker 并初始化
+        Worker[] workers =new Worker[Runtime.getRuntime().availableProcessors()];
+        Worker worker=null;
+        for(int i=0;i<workers.length;i++){
+             workers[i] = new Worker("woker-"+i);
+        }
+        AtomicInteger aount=new AtomicInteger();
         while (true){
             boss.select();
             Iterator<SelectionKey> iter = boss.selectedKeys().iterator();
@@ -32,32 +41,55 @@ public class MultiThreadServer {
                 if(key.isAcceptable()){
                     SocketChannel sc = ssc.accept();
                     sc.configureBlocking(false);
+                    workers[aount.incrementAndGet()%workers.length].register(sc);
                 }
             }
         }
     }
-    class Worker implements Runnable{
+    static class Worker implements Runnable{
 
         private Thread thread;
-        private Selector worker;
+        private Selector selector;
         private String name;
+        /**
+         * 使用ConcurrentLinkedQueue存储需要执行的任务
+         * 亮点！！！！
+         */
+        private ConcurrentLinkedQueue<Runnable> queue=new ConcurrentLinkedQueue<>();
         private volatile  Boolean start=false;
 
-        public Worker(String name) throws IOException {
+        public Worker(String name)  {
+             this.name=name;
+        }
+
+        //初始化线程 和selector
+        public void register( SocketChannel sc) throws IOException {
             if(!start) {
-                Thread thread = new Thread(this, name);
+                thread = new Thread(this, name);
                 thread.start();
-                worker = Selector.open();
+                selector = Selector.open();
                 start=true;
             }
+            queue.add(()->{
+                try {
+                    sc.register(selector,SelectionKey.OP_READ,null);
+                } catch (ClosedChannelException e) {
+                    e.printStackTrace();
+                }
+            });
+            selector.wakeup();
         }
 
         @Override
         public void run() {
            while (true){
                try {
-                   worker.select();
-                   Iterator<SelectionKey> iter = worker.selectedKeys().iterator();
+                   selector.select();
+                   Runnable poll = queue.poll();
+                   if(poll!=null){
+                       poll.run();
+                   }
+                   Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
                    while (iter.hasNext()){
                        SelectionKey key = iter.next();
                        iter.remove();
